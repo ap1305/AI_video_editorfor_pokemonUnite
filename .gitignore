@@ -1,0 +1,7 @@
+.env*
+data
+assets/audio/*
+assets/video/*
+logs
+.venv
+__pycache__/

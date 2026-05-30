@@ -1,0 +1,17 @@
+okay we are not integrating it with youtube and all as of now .
+
+i have one idea rejet if you did not like it > this summary produces by the OCR Scanner is good  not to that extend but what i feel is that chatgpt will understand it and even for 2-3 hr video it will cost hardly .
+
+we will ask chatgpt for the perfect timing along with summary that from when to when we can take the shorts .
+
+we already have qwen 2.5vl 1 to reject the bad videos ( as a body gaurd ) ( but i think gpt answer will be the best and i think we can trust on in blindly still )
+
+we will have another qwen2.5vl model hosted on another location :- this will create summary of the clip what is happening exactly and what it sees .
+
+ now we have summar from two places :-
+
+1. OCR Scanner
+
+2. from qwen2.5 ( hosted on another location which has job to just explain what is happening)
+
+Now we will send both the selected summary to GPt and GPT will tell us which meme to use according to our present indexes ?
