@@ -1,3 +1,4 @@
+#candidate_window.json file generated fromt hsi script should be kept in data/input folder along with video
 import json
 import os
 
