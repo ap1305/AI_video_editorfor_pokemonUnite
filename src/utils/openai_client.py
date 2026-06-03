@@ -184,78 +184,73 @@ def run_macro_scout(candidate_windows_path: str, api_key: str) -> dict:
     with open(candidate_windows_path, 'r', encoding='utf-8') as file:
         candidate_windows = json.load(file)
 
-    # To save tokens and focus on top-tier plays, we only evaluate the top 8 candidates
-    top_candidates = candidate_windows[:8]
-    candidates_string = json.dumps(top_candidates, indent=2)
-
-    client = OpenAI(api_key=api_key)
+    # Give the AI a wider pool so it can actually find 3 to 5 distinct, non-overlapping clips
+    # Widen the pool to 20 candidates for maximum discovery and AI evaluation
+    top_candidates = candidate_windows[:20]
+    candidates_string = json.dumps(top_candidates, separators=(',', ':'))
 
     system_prompt = """
-You are the 'Macro Scout' for an autonomous esports video editor.
-Evaluate the following structured candidate windows from a MOBA match.
-Your job is to act as the executive producer and select the absolute best, most highly-retainable moments to send to the final rendering bay.
+    You are the 'Macro Scout' for an autonomous esports video editor.
+    Evaluate the following structured candidate windows from a MOBA match.
+    Your job is to act as the executive producer and select the absolute best, most highly-retainable moments to send to the final rendering bay.
 
-CRITICAL RULES:
+    CRITICAL RULES:
 
-1. OVERLAP PROTECTION & TIE-BREAKING:
-NEVER select multiple clips that share more than 30% of the same timeframe.
-If two candidate windows overlap significantly, choose ONLY the stronger one.
-If two clips are similarly strong across the board, use this strict tie-breaker hierarchy:
-  1st: Higher `importance_score`
-  2nd: `is_late_game` is true
-  3rd: Higher `audio_density`
-  4th: Presence of `ocr_events`
+    1. QUALITY OVER QUANTITY:
+    Select between 1 and 5 clips. Target 3 clips whenever sufficient quality exists. 
+    Return fewer clips only when additional candidates are clearly weaker.
 
-2. QUALITY GATING:
-Select up to 3 clips.
-ONLY select clips that are genuinely viral-worthy. Base your judgment strictly on the provided data: high `importance_score`, high `audio_density`, presence of `ocr_events`, and `is_late_game`.
-If only 1 clip meets a high quality threshold (confidence > 0.85), return exactly 1. Do not force 3.
+    2. VIRALITY OVERRIDE:
+    Prefer clips containing: multi-player fights, objective steals, comeback moments, last-minute defenses, score swings, high emotional intensity, and unexpected outcomes.
+    Avoid clips that are merely mechanically clean but lack emotional payoff.
 
-3. CLIP DIVERSITY:
-Prefer varied emotional pacing and gameplay structure across selected clips when possible.
-Avoid selecting clips that feel narratively identical.
+    3. THE COMEBACK ARC (DEATHS ARE ALLOWED):
+    Deaths are not automatically negative. A death may be selected if it: creates tension, leads to a comeback, leads to revenge, leads to an objective steal, or is part of a match-defining sequence.
 
-4. NARRATIVE AWARENESS (STRICT ENUMS):
-Assign one of the following narrative types ONLY:
-[FINAL_PUSH, TEAMFIGHT, OBJECTIVE_SECURE, OBJECTIVE_STEAL, CLUTCH_ESCAPE, SOLO_OUTPLAY, COMEBACK, EARLY_SNOWBALL, CHAOTIC_FIGHT]
+    4. OVERLAP PROTECTION & TIE-BREAKING:
+    NEVER select multiple clips that share more than 30% of the same timeframe. If two candidate windows overlap, choose ONLY the stronger one.
+    If clips are similarly strong, use this strict tie-breaker hierarchy:
+      1st: Higher `importance_score`
+      2nd: `is_late_game` is true
+      3rd: Higher `audio_density`
+      4th: Presence of `ocr_events`
 
-5. RETENTION PRIORITY (STRICT ENUMS):
-Rank clips based on estimated viewer retention. You must use ONLY one of these values:
-[HIGH, MEDIUM, LOW]
+    5. NARRATIVE AWARENESS & RETENTION (STRICT ENUMS):
+    - `narrative_type` MUST BE one of: [FINAL_PUSH, TEAMFIGHT, OBJECTIVE_SECURE, OBJECTIVE_STEAL, CLUTCH_ESCAPE, SOLO_OUTPLAY, COMEBACK, EARLY_SNOWBALL, CHAOTIC_FIGHT]
+    - `retention_priority` MUST BE one of: [HIGH, MEDIUM, LOW]
+    - `primary_signal` MUST BE one of: [AUDIO_DRIVEN, VISUAL_CHAOS, OCR_CONFIRMED, MULTI_MODAL]
 
-6. PRIMARY SIGNAL (STRICT ENUMS & DEFINITIONS):
-Identify the core driver of the hype using ONLY one of these values:
-[AUDIO_DRIVEN, VISUAL_CHAOS, OCR_CONFIRMED, MULTI_MODAL].
-*Use MULTI_MODAL only when at least two major signal categories strongly contribute to the clip selection.*
+    6. REQUIRED TELEMETRY (THE REJECTION LOG):
+    Return rejection telemetry ONLY for the top 5 highest-scoring candidates that were evaluated but NOT selected.
 
-7. ANTI-HALLUCINATION & CONSTRAINTS:
-DO NOT invent gameplay details not supported by the metadata.
-The `selection_confidence` field MUST be a float between 0.0 and 1.0.
-
-8. STRICT SCHEMA:
-Do not add extra fields, explanations, markdown, comments, or additional keys outside the required JSON structure. You MUST output ONLY a valid JSON object.
-
-Format EXACTLY like this:
-{
-  "selected_clips": [
+    You MUST return your selection strictly in the following JSON format. Do not use markdown blocks.
     {
-      "clip_number": 1,
-      "window_id": "CANDIDATE_13",
-      "start_time": 675.0,
-      "end_time": 707.0,
-      "narrative_type": "FINAL_PUSH",
-      "primary_signal": "MULTI_MODAL",
-      "retention_priority": "HIGH",
-      "selection_confidence": 0.94,
-      "narrative_reasoning": "Highest tension sequence of the match. Won tie-breaker over Candidate 12 due to higher importance score and late-game positioning."
+      "selected_clips": [
+        {
+          "window_id": "CANDIDATE_13",
+          "start_time": 675.0,
+          "end_time": 707.0,
+          "narrative_type": "FINAL_PUSH",
+          "primary_signal": "MULTI_MODAL",
+          "retention_priority": "HIGH",
+          "selection_confidence": 0.94,
+          "narrative_reasoning": "Highest tension sequence of the match. Won tie-breaker over Candidate 12 due to higher importance score and late-game positioning."
+        }
+      ],
+      "rejected_candidates_telemetry": [
+        {
+          "candidate_id": "CANDIDATE_12",
+          "rejection_reason": "Overlapped heavily with the stronger late-game fight in CANDIDATE_13."
+        }
+      ]
     }
-  ]
-}
-"""
+    """
 
     print("🧠 Routing Candidate Windows through OpenAI API (GPT-4o-mini)...")
     
     try:
+        # 👇 FIX: Initialize the OpenAI Client right here inside the function!
+        client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[

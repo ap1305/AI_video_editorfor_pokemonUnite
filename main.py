@@ -13,9 +13,8 @@ from src.utils.logger import PipelineLogger
 
 from src.utils.openai_client import run_macro_scout
 from src.utils.qwen_pacing_analyzer import analyze_clip_pacing
-from src.utils.gpt_edf_director import generate_edit_decision_file
 from src.utils.pipeline_recovery import PipelineRecoveryManager
-# Add this near your other from src... imports
+
 from src.editing.edf_compiler import generate_master_edf
 
 load_dotenv()
@@ -23,6 +22,30 @@ QWEN_API_KEY = os.getenv("QWEN_API_KEY", "ollama")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 QWEN_PACING_URL = os.getenv("QWEN_PACING_URL")   
 
+
+def adapt_edf_v2_to_v1(v2_blueprint: dict) -> dict:
+    if not v2_blueprint or "segments" in v2_blueprint:
+        return v2_blueprint
+        
+    v1_segments = []
+    for idx, seg in enumerate(v2_blueprint.get("editing_plan", [])):
+        playback = seg.get("playback_action", {})
+        v1_segments.append({
+            "segment_id": f"seg_{idx}",
+            "start_timestamp": float(seg.get("start", 0.0)),
+            "end_timestamp": float(seg.get("end", 0.0)),
+            "editing_intent": {
+                "speed_multiplier": float(playback.get("speed", 1.0)),
+                "action_type": playback.get("type", "standard")
+            }
+        })
+        
+    return {
+        "edf_version": "1.4-adapted",
+        "clip_bounds": v2_blueprint.get("clip_bounds", {}),
+        "segments": v1_segments,
+        "meme_candidates": v2_blueprint.get("meme_candidates", [])
+    }
 # ==========================================
 # THE DYNAMIC ROUTER (INTAKE MENU)
 # ==========================================
@@ -129,11 +152,10 @@ def run_factory_pipeline():
             for idx, clip in enumerate(best_clip_windows):
                 start_time = float(clip.get("start_time", 0.0))
                 end_time = float(clip.get("end_time", 0.0))
-                reasoning = clip.get("narrative_reasoning", "")
+                clip_duration = end_time - start_time
                 
                 print(f"\n--- Orchestrating Event Block #{idx + 1} ({start_time}s to {end_time}s) ---")
                 
-                # 👉 FIX 1: CLIP-LEVEL EXCEPTION HANDLING
                 try: 
                     # --- PHASE 3: The Micro Director ---
                     qwen_pacing_data = manager.load_state(f"qwen_semantics_clip_{idx}")
@@ -145,9 +167,7 @@ def run_factory_pipeline():
                             raise ValueError("Micro Director returned empty data.")
                         manager.save_state(f"qwen_semantics_clip_{idx}", qwen_pacing_data)
 
-                   # ==========================================
                     # --- PHASE 4: Master EDF Compiler V2 ---
-                    # ==========================================
                     edf_data = manager.load_state(f"master_edf_clip_{idx}")
                     if not edf_data:
                         print(f"\n[Phase 4] Executing Master EDF Compiler V2...")
@@ -164,49 +184,58 @@ def run_factory_pipeline():
                             continue
                             
                         manager.save_state(f"master_edf_clip_{idx}", edf_data)
-                    # ==========================================
 
-                    # --- PHASE 5: Fetch Memes/Audio ---
-                    meme_candidates = edf_data.get("meme_candidates", [])
-                    # 👉 FIX 3: EXPLICIT FALLBACK LOGGING
-                    if not meme_candidates:
-                        manager.log_event("meme_fallback_used", {"clip_index": idx})
-                    final_vibe = meme_candidates[0].get("type", "hype") if meme_candidates else "hype"
-                    
-                    matched_meme_path = meme_memory.fetch_matching_meme(vibe_tag=final_vibe)
-                    bgm_path = audio_memory.fetch_matching_audio(vibe_tag=final_vibe)
+                    # --- PHASE 5: Fetch Memes/Audio [PAUSED FOR SPRINT A] ---
+                    # Meme and BGM fetching are disabled while we validate Pacing Architecture
 
-                    # --- PHASE 6: The Renderer ---
-                    output_filename = f"viral_short_clip_{idx + 1}.mp4"
-                    output_path = os.path.join(renderer.output_dir, output_filename)
+                    # --- PHASE 6: The Renderer (Dual Output) ---
+                    shadow_filename = f"shadow_debug_clip_{idx + 1}.mp4"
+                    production_filename = f"viral_short_clip_{idx + 1}.mp4"
                     
-                    # 👉 FIX 4: IDEMPOTENCY CHECK ON VIDEO FILES
-                    if os.path.exists(output_path):
-                        print(f"♻️ [Recovery] Found existing render: {output_filename}. Skipping FFmpeg!")
-                        continue
+                    shadow_path = os.path.join(renderer.output_dir, shadow_filename)
+                    prod_path = os.path.join(renderer.output_dir, production_filename)
+                    
+                    edf_file_path = os.path.join(manager.state_dir, f"master_edf_clip_{idx}.json")
 
-                    print("[Phase 6] Dispatching EDF blueprint to FFmpeg Renderer...")
-                    manager.log_event("ffmpeg_render_start", {"clip_index": idx})
+                    print("\n[Phase 6] Dispatching EDF blueprint to FFmpeg Renderer...")
                     
-                    renderer.render_dynamic_short(
-                        input_path=raw_video_path,
-                        output_filename=output_filename,
-                        start_time=start_time,
-                        end_time=end_time,
-                        edf_blueprint=edf_data, 
-                        meme_overlay_path=matched_meme_path,
-                        bgm_path=bgm_path 
-                    )
-                    
-                    manager.log_event("ffmpeg_render_success", {"clip_index": idx, "file": output_filename})
+                    # 1. GENERATE SHADOW DEBUG (Visual Observability)
+                    if not os.path.exists(shadow_path):
+                        renderer.render_shadow_debug(
+                            input_path=raw_video_path,
+                            edf_json_path=edf_file_path,
+                            output_filename=shadow_filename
+                        )
+                    else:
+                        print(f"♻️ [Recovery] Found existing shadow render: {shadow_filename}")
+
+                    # 2. GENERATE SPRINT A PACING RENDER (Execution Validation)
+                    if not os.path.exists(prod_path):
+                        # 👇 1. Translate to legacy schema
+                        print("[Phase 6] Normalizing EDF Schema via Adapter Layer...")
+                        normalized_edf = adapt_edf_v2_to_v1(edf_data)
+                        
+                        segments_count = len(normalized_edf.get("segments", []))
+                        print(f"📊 [Debug] Adapter output segments: {segments_count}")
+                        
+                        if segments_count == 0:
+                            print("❌ [Fatal] Adapter failed to generate valid segments. Halting render.")
+                            continue
+
+                        print("[Phase 6] Dispatching EDF blueprint to FFmpeg Renderer...")
+                        
+                        renderer.render_dynamic_short(
+                            input_path=raw_video_path,
+                            output_filename=production_filename,
+                            edf_blueprint=normalized_edf # 👈 2. Pass the adapted data!
+                        )
+                    else:
+                        print(f"♻️ [Recovery] Found existing production render: {production_filename}")
+
+                    manager.log_event("ffmpeg_render_success", {"clip_index": idx})
                     print(f"--- Event Block #{idx + 1} Completed Successfully ---")
 
-                    # 👉 FIX 5: CLEANUP TEMP WORKSPACE
-                    shutil.rmtree(renderer.temp_dir, ignore_errors=True)
-                    os.makedirs(renderer.temp_dir, exist_ok=True)
-
                 except Exception as clip_e:
-                    # IF A CLIP CRASHES, LOG IT AND MOVE TO THE NEXT CLIP
                     print(f"⚠️ [Clip Error] Failed on Event Block #{idx + 1}: {clip_e}")
                     manager.log_event("clip_failure", {"clip_index": idx, "reason": str(clip_e)})
                     continue 
@@ -215,7 +244,6 @@ def run_factory_pipeline():
             print(f"--- Job Finished. Output and logs secured in {manager.state_dir} ---")
             
         except Exception as e:
-            # THIS ONLY CATCHES FATAL PIPELINE ERRORS (e.g., Macro Scout crashing)
             print(f"[Queue Manager] Fatal failure on {raw_video_path}: {e}")
             manager.log_event("fatal_error", {"reason": str(e), "file": raw_video_path})
             db.update_job_status(raw_video_path, "FAILED")

@@ -24,7 +24,7 @@ class JobAbortedException(Exception):
     pass
 
 # 👇 We changed the default model name right here! 👇
-def execute_with_colab_fallback(api_key: str, base_url: str, messages: list, model: str = "qwen2.5vl") -> str:
+def execute_with_colab_fallback(api_key: str, base_url: str, messages: list, model: str = "qwen-director"):
     """
     Executes an LLM call. If the connection fails, it pauses execution and 
     presents an interactive recovery menu to the user.
@@ -35,10 +35,10 @@ def execute_with_colab_fallback(api_key: str, base_url: str, messages: list, mod
         try:
             client = OpenAI(api_key=api_key, base_url=current_url)
             response = client.chat.completions.create(
-                model=model, # Now it will correctly pass "qwen2.5vl"
+                model=model, 
                 messages=messages,
                 temperature=0.1,
-                max_tokens=512
+                max_tokens=1500 # 👈 Bump this up so it doesn't cut off mid-sentence!
             )
             return response.choices[0].message.content
             
