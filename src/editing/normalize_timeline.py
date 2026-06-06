@@ -1,7 +1,69 @@
 import os
 import json
 from typing import List, Dict, Any
+import copy
 
+def fill_timeline_gaps(editing_plan: list, clip_start: float, clip_end: float) -> list:
+    """
+    Ensures the normalized EDF covers the full selected clip window.
+    Missing unlabeled gaps/tails are filled with safe normal-speed gameplay.
+    Handles overlapping AI hallucinations safely.
+    """
+    def create_default_segment(start, end, reason):
+        return {
+            "start": round(float(start), 3),
+            "end": round(float(end), 3),
+            "playback_action": {
+                "type": "speed_control",
+                "speed": 1.0
+            },
+            "_audit": {
+                "decision": reason,
+                "reason": "No Qwen label covered this interval"
+            }
+        }
+
+    if not editing_plan:
+        return [create_default_segment(clip_start, clip_end, "full_clip_default_fill")]
+
+    sorted_plan = sorted(editing_plan, key=lambda x: float(x["start"]))
+    filled_plan = []
+    current_time = float(clip_start)
+
+    for original_seg in sorted_plan:
+        seg = copy.deepcopy(original_seg)
+
+        seg_start = max(float(seg["start"]), float(clip_start))
+        seg_end = min(float(seg["end"]), float(clip_end))
+
+        if seg_end <= seg_start:
+            continue
+
+        # Fill gap before segment
+        if seg_start > current_time:
+            filled_plan.append(create_default_segment(current_time, seg_start, "unclassified_gap_fill"))
+
+        # If AI hallucinated an overlap, trim the start forward
+        if seg_start < current_time:
+            seg_start = current_time
+
+        if seg_end <= seg_start:
+            continue
+
+        seg["start"] = round(seg_start, 3)
+        seg["end"] = round(seg_end, 3)
+
+        if "playback_action" not in seg:
+            seg["playback_action"] = {"type": "speed_control", "speed": 1.0}
+
+        filled_plan.append(seg)
+        current_time = max(current_time, seg_end)
+
+    # Fill final tail
+    if current_time < float(clip_end):
+        filled_plan.append(create_default_segment(current_time, clip_end, "unclassified_tail_fill"))
+
+    return filled_plan
 # In a full run, this would be loaded via a yaml.safe_load("config.yaml")
 CONFIG = {
     "editor": {
@@ -102,6 +164,9 @@ def normalize_timeline(qwen_analysis: Dict[str, Any], clip_start: float, clip_en
             }
         }
         normalized_plan.append(segment_data)
+
+    # 5. Save the Compiler Audit Log
+    normalized_plan = fill_timeline_gaps(normalized_plan, clip_start, clip_end)
 
     # 5. Save the Compiler Audit Log
     audit_output = {

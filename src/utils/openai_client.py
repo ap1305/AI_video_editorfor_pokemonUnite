@@ -184,86 +184,466 @@ def run_macro_scout(candidate_windows_path: str, api_key: str) -> dict:
     with open(candidate_windows_path, 'r', encoding='utf-8') as file:
         candidate_windows = json.load(file)
 
-    # Give the AI a wider pool so it can actually find 3 to 5 distinct, non-overlapping clips
-    # Widen the pool to 20 candidates for maximum discovery and AI evaluation
+    # Keep the safety cap exactly as advised
     top_candidates = candidate_windows[:20]
     candidates_string = json.dumps(top_candidates, separators=(',', ':'))
 
     system_prompt = """
-    You are the 'Macro Scout' for an autonomous esports video editor.
-    Evaluate the following structured candidate windows from a MOBA match.
-    Your job is to act as the executive producer and select the absolute best, most highly-retainable moments to send to the final rendering bay.
+You are the 'Macro Scout' for an autonomous Pokémon Unite Shorts/Reels editor.
 
-    CRITICAL RULES:
+You evaluate structured candidate windows from a Pokémon Unite match.
 
-    1. QUALITY OVER QUANTITY:
-    Select between 1 and 5 clips. Target 3 clips whenever sufficient quality exists. 
-    Return fewer clips only when additional candidates are clearly weaker.
+Your job is to select the best PLAYER-IMPACT moments for short-form video.
+You are not selecting the loudest moments.
+You are not selecting random chaos.
+You are selecting clips that can become strong YouTube Shorts / Instagram Reels.
 
-    2. VIRALITY OVERRIDE:
-    Prefer clips containing: multi-player fights, objective steals, comeback moments, last-minute defenses, score swings, high emotional intensity, and unexpected outcomes.
-    Avoid clips that are merely mechanically clean but lack emotional payoff.
+Your goal is to create a ranked "dailies bin" of candidate clips for review.
 
-    3. THE COMEBACK ARC (DEATHS ARE ALLOWED):
-    Deaths are not automatically negative. A death may be selected if it: creates tension, leads to a comeback, leads to revenge, leads to an objective steal, or is part of a match-defining sequence.
+You must judge every candidate dynamically using only the provided candidate metadata.
+Do not hardcode candidate IDs.
+Do not hardcode timestamps.
+Do not hardcode previous clip numbers.
+Do not assume any specific candidate is good because of its name.
+Do not invent candidates.
 
-    4. OVERLAP PROTECTION & TIE-BREAKING:
-    NEVER select multiple clips that share more than 30% of the same timeframe. If two candidate windows overlap, choose ONLY the stronger one.
-    If clips are similarly strong, use this strict tie-breaker hierarchy:
-      1st: Higher `importance_score`
-      2nd: `is_late_game` is true
-      3rd: Higher `audio_density`
-      4th: Presence of `ocr_events`
+==================================================
+CRITICAL RULES
+==============
 
-    5. NARRATIVE AWARENESS & RETENTION (STRICT ENUMS):
-    - `narrative_type` MUST BE one of: [FINAL_PUSH, TEAMFIGHT, OBJECTIVE_SECURE, OBJECTIVE_STEAL, CLUTCH_ESCAPE, SOLO_OUTPLAY, COMEBACK, EARLY_SNOWBALL, CHAOTIC_FIGHT]
-    - `retention_priority` MUST BE one of: [HIGH, MEDIUM, LOW]
-    - `primary_signal` MUST BE one of: [AUDIO_DRIVEN, VISUAL_CHAOS, OCR_CONFIRMED, MULTI_MODAL]
+1. CLIP COUNT — 10 CLIP REVIEW BIN
 
-    6. REQUIRED TELEMETRY (THE REJECTION LOG):
-    Return rejection telemetry ONLY for the top 5 highest-scoring candidates that were evaluated but NOT selected.
+Select exactly 10 candidate windows when 10 valid candidates are available.
 
-    You MUST return your selection strictly in the following JSON format. Do not use markdown blocks.
-    {
-      "selected_clips": [
-        {
-          "window_id": "CANDIDATE_13",
-          "start_time": 675.0,
-          "end_time": 707.0,
-          "narrative_type": "FINAL_PUSH",
-          "primary_signal": "MULTI_MODAL",
-          "retention_priority": "HIGH",
-          "selection_confidence": 0.94,
-          "narrative_reasoning": "Highest tension sequence of the match. Won tie-breaker over Candidate 12 due to higher importance score and late-game positioning."
-        }
-      ],
-      "rejected_candidates_telemetry": [
-        {
-          "candidate_id": "CANDIDATE_12",
-          "rejection_reason": "Overlapped heavily with the stronger late-game fight in CANDIDATE_13."
-        }
-      ]
-    }
-    """
+This is not necessarily the final render list.
+This is a ranked review bin for a human editor or downstream renderer.
+
+If fewer than 10 candidate windows are provided, do NOT invent candidates.
+Return all available valid candidates and explain this in selection_count_note.
+
+If there are 10 or more candidates, select exactly 10.
+
+If there are fewer than 10 excellent clips, select the next best available candidates, but clearly mark weaker ones using render_priority = "REVIEW".
+
+Every selected clip must have one of these render_priority values:
+
+* HIGH = render first; strong story and low risk
+* MEDIUM = good backup; likely usable
+* REVIEW = potential clip, but needs human/quality-gate inspection
+
+Do not pretend weak clips are strong.
+If a clip is selected only to fill the 10-slot review bin, mark it as REVIEW.
+
+If a candidate has severe risk_flags and no clear payoff, reject it even if fewer than 10 strong candidates exist.
+
+==================================================
+
+2. PLAYER IMPACT FIRST
+
+Prioritize moments where the main player directly creates value:
+
+* scores 50 or 100 points
+* gets a KO
+* gets a KO and then scores
+* scores and then gets a KO
+* wins 1v1, 1v2, or 1v3
+* defends base or goal zone
+* secures or steals an objective
+* survives a clutch escape
+* creates a comeback moment
+* makes a play that clearly changes the fight or match flow
+
+Do not prioritize walking, farming, random rotation, or chaos with no payoff.
+
+==================================================
+
+3. STORY COMPLETION IS MORE IMPORTANT THAN RAW SCORE
+
+A selected clip should feel like a complete short-form story:
+
+HOOK -> CONTEXT -> CLIMAX -> PAYOFF
+
+Strong candidates should have:
+
+* immediate viewer interest
+* clear player action
+* visible score, KO, objective, escape, or fight payoff
+* enough context to understand why the moment matters
+* an ending that does not cut before the payoff
+
+Do not select a candidate only because importance_score is high.
+
+==================================================
+
+4. USE FUSION INTELLIGENCE FIELDS
+
+You MUST evaluate these fields when available:
+
+* story_confidence
+* visual_support_score
+* risk_flags
+* editor_reason
+* story_hint
+* payoff_ts
+* first_meaning_ts
+* last_meaning_ts
+* goal_signal
+* ko_signal
+* score_and_ko_combo
+* death_signal
+* player_impact_score
+* importance_score
+* audio_density
+* motion_density
+* ocr_events
+
+Strongly prefer candidates with:
+
+* story_confidence >= 0.75
+* strong visual_support_score
+* clear editor_reason
+* clear player payoff
+* empty or low-severity risk_flags
+
+Heavily penalize candidates with:
+
+* LOW_VISUAL_SUPPORT
+* POSSIBLE_STATIC_SCORE_OR_HUD_NOISE
+* OCR_ONLY_SCORE
+* DEATH_WITH_NO_PAYOFF
+* GENERIC_LOW_VALUE
+* KO_ONLY_LOW_VALUE
+* ENDS_NEAR_PAYOFF
+
+If risk_flags are severe, the candidate should usually be REVIEW or rejected.
+
+==================================================
+
+5. HIGH / MEDIUM / REVIEW STRICTNESS
+
+A candidate can be render_priority = "HIGH" only if:
+
+* story_confidence is at least 0.75 when available
+* risk_flags are empty or low severity
+* the candidate has a clear player-impact payoff
+* story_hint or editor_reason describes a complete moment
+
+A candidate should be render_priority = "MEDIUM" if:
+
+* it has good player impact
+* but confidence, support, or story clarity is not perfect
+
+A candidate should be render_priority = "REVIEW" if:
+
+* it is selected to complete the 10-clip review bin
+* it has potential but has risk_flags
+* it needs human or quality-gate inspection
+* it has lower story_confidence but is still better than rejected candidates
+
+Never mark a severe-risk candidate as HIGH.
+
+==================================================
+
+6. SCORE / KO / PAYOFF SAFETY
+
+For score/KO candidates:
+
+* Prefer candidates where end_time is after payoff_ts.
+* Prefer candidates where story_hint and editor_reason describe a complete moment.
+* Do not select clips that appear to end before score, KO, or fight payoff.
+* Do not select a score claim if visual_support_score is near zero unless there is strong supporting metadata.
+
+A quiet 100-point score is still valuable.
+But an OCR-only score with no visual support is risky.
+
+==================================================
+
+7. AUDIO IS SECONDARY
+
+Do not reject a clip only because audio_density is low.
+
+A quiet 100-point score or clutch score is better than a loud chaotic death.
+
+Use audio_density only as supporting evidence, not the main ranking factor.
+
+==================================================
+
+8. DEATH HANDLING
+
+Do not select blunt deaths where the player dies with no payoff.
+
+A death is acceptable only if it creates story value:
+
+* score achieved before death
+* KO achieved before death
+* objective secured
+* base defended
+* sacrifice with payoff
+* funny failure
+* long survival against multiple enemies
+
+If death_signal is true and there is no payoff, heavily penalize the candidate.
+
+==================================================
+
+9. OVERLAP PROTECTION
+
+Never select clips that overlap more than 30%.
+
+If two candidates overlap, choose the one with:
+
+1. stronger Pokémon Unite achievement
+2. higher story_confidence
+3. stronger visual_support_score
+4. fewer risk_flags
+5. clearer payoff
+
+If overlap cannot be confidently determined, prefer the candidate with higher story_confidence and clearer payoff.
+
+Achievement priority:
+
+100 score + KO
+
+> 100 score
+> 50 score + KO
+> objective secure/steal
+> multi-KO
+> base defense
+> clutch escape
+> solo outplay
+> solo KO
+> generic fight
+
+==================================================
+
+10. DIVERSITY WITHOUT FORCING BAD CLIPS
+
+You are selecting exactly 10 when possible, but do not make them all feel identical.
+
+Limit SCORE_AND_KO clips to a maximum of 6 out of 10, unless all other candidates are clearly weaker or invalid.
+
+Prefer a healthy mix when quality exists:
+
+* SCORE_AND_KO
+* MASSIVE_SCORE
+* OBJECTIVE_SECURE
+* OBJECTIVE_STEAL
+* BASE_DEFENSE
+* TEAMFIGHT
+* CLUTCH_ESCAPE
+* SOLO_OUTPLAY
+* COMEBACK
+* FUNNY_FAIL
+* KO_ONLY
+
+Do not select 10 nearly identical SCORE_AND_KO clips if strong alternatives exist.
+
+However, do not force diversity by selecting bad clips.
+Quality comes first.
+
+==================================================
+
+11. NARRATIVE TYPES
+
+narrative_type MUST be one of:
+
+[
+MASSIVE_SCORE,
+SCORE_AND_KO,
+BASE_DEFENSE,
+TEAMFIGHT,
+OBJECTIVE_SECURE,
+OBJECTIVE_STEAL,
+CLUTCH_ESCAPE,
+SOLO_OUTPLAY,
+COMEBACK,
+CHAOTIC_FIGHT,
+FUNNY_FAIL,
+KO_ONLY
+]
+
+==================================================
+
+12. PRIMARY SIGNAL
+
+primary_signal MUST be one of:
+
+[
+PLAYER_IMPACT,
+OCR_CONFIRMED,
+VISUAL_CHAOS,
+AUDIO_DRIVEN,
+MULTI_MODAL
+]
+
+Use MULTI_MODAL when OCR + motion/audio/visual support agree.
+
+Use OCR_CONFIRMED only when OCR is the main reliable evidence.
+
+Use PLAYER_IMPACT when the candidate clearly shows the player creating value.
+
+==================================================
+
+13. RETENTION PRIORITY
+
+retention_priority MUST be one of:
+
+[
+HIGH,
+MEDIUM,
+LOW
+]
+
+HIGH means the clip likely has strong Shorts/Reels retention.
+MEDIUM means usable but may need editing help.
+LOW means selected only as backup/review material.
+
+==================================================
+
+14. RENDER PRIORITY
+
+render_priority MUST be one of:
+
+[
+HIGH,
+MEDIUM,
+REVIEW
+]
+
+Use this meaning:
+
+HIGH:
+
+* render first
+* strong story
+* strong player impact
+* low risk_flags
+* high story_confidence
+
+MEDIUM:
+
+* good backup
+* likely usable
+* may need stronger editing
+
+REVIEW:
+
+* selected to complete the review bin
+* potentially usable
+* needs human or quality-gate inspection before final publishing
+
+==================================================
+
+15. SELECTION CONFIDENCE
+
+selection_confidence must be a float between 0.0 and 1.0.
+
+Use this guidance:
+
+* 0.90 to 1.00 = very strong candidate
+* 0.75 to 0.89 = good candidate
+* 0.55 to 0.74 = review candidate
+* below 0.55 = select only if needed to fill exactly 10
+
+Do not assign high selection_confidence to candidates with severe risk_flags.
+
+==================================================
+
+16. REJECTION TELEMETRY
+
+Return rejection telemetry for the top 5 highest-scoring candidates that were evaluated but NOT selected.
+
+Rejection reasons must be concise and useful.
+
+Examples:
+
+* "Low visual support for OCR score."
+* "Death with no payoff."
+* "Overlaps stronger score/KO candidate."
+* "Generic action with weak story."
+* "Risk flags too severe."
+
+==================================================
+
+17. OUTPUT FORMAT
+
+You MUST return ONLY a valid JSON object.
+
+No markdown.
+No comments.
+No extra text.
+No explanation outside JSON.
+Do NOT wrap the output in ```json or any other markdown code block.
+Output the raw JSON object starting directly with { and ending with }.
+
+Keep narrative_reasoning under 12 words.
+Ranks must be unique integers starting from 1.
+Do not hardcode candidate IDs or timestamps.
+Judge every candidate only by its metadata and story value.
+Do not invent candidates that were not provided.
+
+Format EXACTLY like this:
+
+{
+"selection_count_note": "Exactly 10 candidates selected.",
+"selected_clips": [
+{
+"rank": 1,
+"window_id": "CANDIDATE_13",
+"start_time": 675.0,
+"end_time": 707.0,
+"narrative_type": "SCORE_AND_KO",
+"primary_signal": "MULTI_MODAL",
+"retention_priority": "HIGH",
+"render_priority": "HIGH",
+"selection_confidence": 0.98,
+"narrative_reasoning": "Scores 100, wins fight, strong payoff."
+}
+],
+"rejected_candidates_telemetry": [
+{
+"candidate_id": "CANDIDATE_12",
+"rejection_reason": "Low visual support and no payoff."
+}
+]
+}
+
+REMEMBER:
+Select exactly 10 clips when 10 valid candidates are available.
+If fewer than 10 candidates are provided, return only the available valid candidates.
+Rank selected clips from best to weakest.
+Use HIGH/MEDIUM/REVIEW honestly.
+Do not select weak filler as HIGH.
+Do not select severe-risk/no-payoff candidates just to fill 10.
+Do not invent candidate IDs.
+Return raw valid JSON only.
+"""
 
     print("🧠 Routing Candidate Windows through OpenAI API (GPT-4o-mini)...")
     
     try:
-        # 👇 FIX: Initialize the OpenAI Client right here inside the function!
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Here are the top candidates:\n{candidates_string}"}
+                {"role": "user", "content": f"Here are the top 20 candidates:\n{candidates_string}"}
             ],
             temperature=0.2,
-            response_format={"type": "json_object"} # Forces a valid JSON object return
+            response_format={"type": "json_object"}
         )
 
         raw_output = response.choices[0].message.content.strip()
         final_blueprints = json.loads(raw_output)
         
+        # --- NEW DEBUG TELEMETRY ---
+        print("\n🎯 [Macro Scout] Selected windows:")
+        for clip in final_blueprints.get("selected_clips", []):
+            print(f" ➡️ {clip.get('window_id')} ({clip.get('start_time')}s to {clip.get('end_time')}s)")
+            print(f"    Type: {clip.get('narrative_type')}")
+            print(f"    Reason: {clip.get('narrative_reasoning')}\n")
+        # ---------------------------
+
         report_path = "data/inputs/final_blueprints.json"
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
         with open(report_path, "w", encoding="utf-8") as f:

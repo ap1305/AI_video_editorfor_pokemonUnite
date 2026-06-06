@@ -65,7 +65,10 @@ def extract_dense_cinematic_frames(video_path: str, start_time: float, end_time:
     print(f"✅ [Micro Director] Extracted {len(base64_frames)} sequential frames.")
     return base64_frames
 
-def analyze_clip_pacing(video_path: str, start_time: float, end_time: float, api_key: str, base_url: str) -> Dict[str, Any]:
+
+# 👇 UPDATE 1: Added strict_mode parameter to signature
+# 👇 Updated signature with strict_mode=False
+def analyze_clip_pacing(video_path: str, start_time: float, end_time: float, api_key: str, base_url: str, strict_mode: bool = False) -> Dict[str, Any]:
     base_frames_data = extract_dense_cinematic_frames(video_path, start_time, end_time)
     
     if not base_frames_data:
@@ -73,9 +76,9 @@ def analyze_clip_pacing(video_path: str, start_time: float, end_time: float, api
         return {}
         
     # ==========================================
-    # 👇 FIX 2: Strict 6-Frame limit to guarantee we stay under 4096 tokens
+    # 👇 CORRECTED COMMENT: Strict 30-frame limit to reduce context overflow risk
     # ==========================================
-    MAX_SAFE_FRAMES = 8
+    MAX_SAFE_FRAMES = 30
     if len(base_frames_data) > MAX_SAFE_FRAMES:
         print(f"⚠️ [VRAM Protection] Downsampling {len(base_frames_data)} frames to {MAX_SAFE_FRAMES} to prevent Context Overflow...")
         step = len(base_frames_data) / MAX_SAFE_FRAMES
@@ -149,6 +152,29 @@ def analyze_clip_pacing(video_path: str, start_time: float, end_time: float, api
       "primary_climax_id": "<string matching a highlight segment_id>",
       "primary_climax_confidence": <float>
     }}
+    """
+
+    # 👇 CORRECTED STRICT RETRY PROMPT 👇
+    if strict_mode:
+        system_prompt += """
+    ==================================================
+    STRICT RETRY MODE TRIGGERED:
+    Your previous edit failed quality checks because it ruined pacing, classified important action as dead air, or had a boring hook.
+
+    NEW MANDATORY RULES:
+    1. The first 2 seconds must contain a hook: enemy presence, combat, scoring, danger, KO, chase, or immediate payoff.
+    2. If the candidate begins with walking, rotation, farming, or dead space, classify that opening as dead_air_segments so the compiler can trim/compress it.
+    3. Never classify combat, scoring, KO, objective, enemy engagement, clutch escape, or payoff as dead_air_segments.
+    4. All combat, scoring, KO, objective, enemy engagement, and payoff moments must be placed in highlight_segments.
+    5. Dead air means only walking, farming, map travel, rotation, or no immediate payoff.
+    6. Keep visual_evidence and reason under 5 words each.
+
+    CRITICAL SCHEMA REMINDER:
+    You MUST still output the exact same semantic blueprint JSON schema requested above.
+    Do not include markdown.
+    Do not include conversational explanations.
+    Return ONLY valid JSON.
+    ==================================================
     """
     
     content = [{"type": "text", "text": system_prompt}]

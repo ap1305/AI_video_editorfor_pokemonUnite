@@ -38,7 +38,7 @@ def execute_with_colab_fallback(api_key: str, base_url: str, messages: list, mod
                 model=model, 
                 messages=messages,
                 temperature=0.1,
-                max_tokens=1500 # 👈 Bump this up so it doesn't cut off mid-sentence!
+                max_tokens=4096 # 👈 Bump this up so it doesn't cut off mid-sentence!
             )
             return response.choices[0].message.content
             

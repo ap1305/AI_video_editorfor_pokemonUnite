@@ -1,8 +1,14 @@
 import os
 import json
 import shutil
+import gc
 from typing import List
 from dotenv import load_dotenv
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 from src.utils.youtube_downloader import fetch_youtube_video
 from src.memory.chroma_client import TemporalMemoryEngine, MemeMemoryIndex, AudioMemoryIndex
@@ -22,7 +28,98 @@ QWEN_API_KEY = os.getenv("QWEN_API_KEY", "ollama")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 QWEN_PACING_URL = os.getenv("QWEN_PACING_URL")   
 
+# ==========================================
+# QUALITY GATE & VRAM MANAGEMENT
+# ==========================================
+def flush_vram():
+    """Aggressively clears system RAM and local GPU VRAM."""
+    gc.collect()
+    if torch and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
+def enforce_safety_and_evaluate(edf_timeline):
+    """
+    Enforces pacing safety without blindly rejecting meaning-preserving compression.
+    Includes expanded metadata search to prevent silent failures.
+    """
+    total_duration = 0.0
+    ff_duration = 0.0
+    meaning_fastforwarded = False
+    starts_with_long_dead_air = False
+
+    protected_keywords = [
+        "combat", "fight", "enemy", "score", "goal", "ko",
+        "objective", "rayquaza", "zapdos", "clutch",
+        "escape", "low_hp", "payoff"
+    ]
+
+    for idx, segment in enumerate(edf_timeline):
+        start = float(segment.get("start_time", segment.get("start", 0)))
+        end = float(segment.get("end_time", segment.get("end", 0)))
+        seg_duration = max(0.0, end - start)
+        total_duration += seg_duration
+
+        # Schema-safe speed extraction
+        speed = 1.0
+        if "speed" in segment:
+            speed = float(segment.get("speed", 1.0))
+        elif isinstance(segment.get("playback_action"), dict):
+            speed = float(segment["playback_action"].get("speed", 1.0))
+
+        # Hard speed cap
+        if speed > 2.0:
+            print(f"⚠️ [Pacing Safety] Capping speed from {speed}x to 2.0x")
+            speed = 2.0
+            if "speed" in segment:
+                segment["speed"] = speed
+            elif isinstance(segment.get("playback_action"), dict):
+                segment["playback_action"]["speed"] = speed
+
+        # Avoid glitchy speedups on tiny segments
+        if seg_duration < 2.0 and speed > 1.0:
+            speed = 1.0
+            if "speed" in segment:
+                segment["speed"] = speed
+            elif isinstance(segment.get("playback_action"), dict):
+                segment["playback_action"]["speed"] = speed
+
+        # 👇 EXPANDED LABEL SEARCH: Prevents silent failure if EDF keys vary 👇
+        label_text = " ".join([
+            str(segment.get("segment_type", "")),
+            str(segment.get("label", "")),
+            str(segment.get("semantic_label", "")),
+            str(segment.get("reason", "")),
+            str(segment.get("visual_summary", "")),
+            str(segment.get("action", "")),
+            str(segment.get("emphasis", "")),
+            str(segment.get("description", "")),
+            str(segment.get("content_type", "")),
+        ]).lower()
+
+        is_protected = any(k in label_text for k in protected_keywords)
+
+        if speed > 1.0:
+            ff_duration += seg_duration
+            if is_protected:
+                meaning_fastforwarded = True
+            if idx == 0 and seg_duration > 3.0:
+                starts_with_long_dead_air = True
+
+    if total_duration <= 0:
+        return False, "Failed: zero duration timeline."
+
+    ff_ratio = ff_duration / total_duration
+
+    if meaning_fastforwarded:
+        return False, "Failed: meaning-critical action was fast-forwarded."
+
+    if starts_with_long_dead_air:
+        return False, "Failed: clip starts with more than 3 seconds of fast-forward/dead-air."
+
+    if ff_ratio > 0.60:
+        print(f"⚠️ [Quality Gate Warning] {ff_ratio*100:.1f}% fast-forward, but protected action is preserved. Passing.")
+
+    return True, "Passed"
 def adapt_edf_v2_to_v1(v2_blueprint: dict) -> dict:
     if not v2_blueprint or "segments" in v2_blueprint:
         return v2_blueprint
@@ -46,6 +143,7 @@ def adapt_edf_v2_to_v1(v2_blueprint: dict) -> dict:
         "segments": v1_segments,
         "meme_candidates": v2_blueprint.get("meme_candidates", [])
     }
+
 # ==========================================
 # THE DYNAMIC ROUTER (INTAKE MENU)
 # ==========================================
@@ -113,12 +211,10 @@ def run_factory_pipeline():
     audio_memory = AudioMemoryIndex(client_instance=temporal_memory.client)
     renderer = AdvancedVideoRenderingEngine(output_dir="data/renders")
 
-
     for raw_video_path in pending_videos:
         print(f"\n--- [Queue] Processing source: {raw_video_path} ---")
         db.update_job_status(raw_video_path, "PROCESSING")
         
-        # 1. Boot the Deterministic Recovery Manager
         manager = PipelineRecoveryManager(raw_video_path)
         
         try:
@@ -152,38 +248,92 @@ def run_factory_pipeline():
             for idx, clip in enumerate(best_clip_windows):
                 start_time = float(clip.get("start_time", 0.0))
                 end_time = float(clip.get("end_time", 0.0))
-                clip_duration = end_time - start_time
                 
                 print(f"\n--- Orchestrating Event Block #{idx + 1} ({start_time}s to {end_time}s) ---")
                 
                 try: 
-                    # --- PHASE 3: The Micro Director ---
-                    qwen_pacing_data = manager.load_state(f"qwen_semantics_clip_{idx}")
-                    if not qwen_pacing_data:
-                        print("[Phase 3] Booting Micro Director...")
-                        qwen_pacing_data = analyze_clip_pacing(raw_video_path, start_time, end_time, QWEN_API_KEY, QWEN_PACING_URL)
-                        
-                        if not qwen_pacing_data:
-                            raise ValueError("Micro Director returned empty data.")
-                        manager.save_state(f"qwen_semantics_clip_{idx}", qwen_pacing_data)
-
-                    # --- PHASE 4: Master EDF Compiler V2 ---
-                    edf_data = manager.load_state(f"master_edf_clip_{idx}")
-                    if not edf_data:
-                        print(f"\n[Phase 4] Executing Master EDF Compiler V2...")
-                        
-                        edf_data = generate_master_edf(
-                            qwen_analysis=qwen_pacing_data, 
-                            clip_start=start_time, 
-                            clip_end=end_time, 
-                            run_dir=manager.state_dir
-                        )
-                        
-                        if not edf_data:
-                            print("❌ [Phase 4] Failed to compile Master EDF. Skipping clip.")
-                            continue
+                    # ==========================================
+                    # THE QUALITY GATE & STRICT RETRY LOOP
+                    # ==========================================
+                    is_valid = False
+                    edf_data = None
+                    
+                    # Check cache first
+                    cached_qwen = manager.load_state(f"qwen_semantics_clip_{idx}")
+                    cached_edf = manager.load_state(f"master_edf_clip_{idx}")
+                    
+                    if cached_qwen and cached_edf:
+                        print("♻️ [Recovery] Found cached EDF and Qwen semantics. Evaluating...")
+                        is_valid, reason = enforce_safety_and_evaluate(cached_edf.get("editing_plan", []))
+                        if is_valid:
+                            edf_data = cached_edf
+                        else:
+                            print(f"⚠️ Cached EDF failed quality gate: {reason}. Forcing regeneration...")
+                    
+                    # Generate/Regenerate if needed
+                    if not is_valid:
+                        for attempt in range(2):
+                            strict_flag = (attempt == 1) # True on the second attempt (the retry)
                             
-                        manager.save_state(f"master_edf_clip_{idx}", edf_data)
+                            if strict_flag:
+                                print("♻️ Retrying Qwen prompt with STRICT hook constraints...")
+                            else:
+                                print(f"[Phase 3] Booting Micro Director (Attempt 1)...")
+                            
+                            try:
+                                # Try passing strict mode to your Qwen analyzer
+                                qwen_pacing_data = analyze_clip_pacing(
+                                    raw_video_path, start_time, end_time, 
+                                    QWEN_API_KEY, QWEN_PACING_URL, 
+                                    strict_mode=strict_flag
+                                )
+                            except TypeError:
+                                # Fallback if analyze_clip_pacing doesn't accept strict_mode kwarg yet
+                                qwen_pacing_data = analyze_clip_pacing(
+                                    raw_video_path, start_time, end_time, 
+                                    QWEN_API_KEY, QWEN_PACING_URL
+                                )
+                            
+                            if not qwen_pacing_data:
+                                raise ValueError("Micro Director returned empty data.")
+
+                            print(f"[Phase 4] Executing Master EDF Compiler V2...")
+                            edf_data = generate_master_edf(
+                                qwen_analysis=qwen_pacing_data, 
+                                clip_start=start_time, 
+                                clip_end=end_time, 
+                                run_dir=manager.state_dir
+                            )
+                            
+                            if not edf_data:
+                                print("❌ [Phase 4] Failed to compile Master EDF. Skipping clip.")
+                                break
+                            
+                            # 👇 THE MEANING-AWARE QUALITY GATE 👇
+                            is_valid, reason = enforce_safety_and_evaluate(edf_data.get("editing_plan", []))
+                            
+                            if is_valid:
+                                manager.save_state(f"qwen_semantics_clip_{idx}", qwen_pacing_data)
+                                manager.save_state(f"master_edf_clip_{idx}", edf_data)
+                                print("✅ Quality Gate Passed. Dispatching to FFmpeg...")
+                                break
+                            else:
+                                print(f"🚫 Quality Gate Triggered: {reason}")
+                                if attempt == 0:
+                                    print("🧹 Flushing local VRAM before retrying with stricter constraints...")
+                                    del edf_data
+                                    del qwen_pacing_data
+                                    flush_vram()
+                                else:
+                                    print(f"❌ Clip failed Quality Gate twice. Skipping render.")
+                                    edf_data = None
+                                    flush_vram()
+                    
+                    # If it failed twice, skip this clip and go to the next one
+                    if not edf_data or not is_valid:
+                        continue
+
+                    
 
                     # --- PHASE 5: Fetch Memes/Audio [PAUSED FOR SPRINT A] ---
                     # Meme and BGM fetching are disabled while we validate Pacing Architecture
@@ -211,7 +361,6 @@ def run_factory_pipeline():
 
                     # 2. GENERATE SPRINT A PACING RENDER (Execution Validation)
                     if not os.path.exists(prod_path):
-                        # 👇 1. Translate to legacy schema
                         print("[Phase 6] Normalizing EDF Schema via Adapter Layer...")
                         normalized_edf = adapt_edf_v2_to_v1(edf_data)
                         
@@ -223,11 +372,10 @@ def run_factory_pipeline():
                             continue
 
                         print("[Phase 6] Dispatching EDF blueprint to FFmpeg Renderer...")
-                        
                         renderer.render_dynamic_short(
                             input_path=raw_video_path,
                             output_filename=production_filename,
-                            edf_blueprint=normalized_edf # 👈 2. Pass the adapted data!
+                            edf_blueprint=normalized_edf
                         )
                     else:
                         print(f"♻️ [Recovery] Found existing production render: {production_filename}")
