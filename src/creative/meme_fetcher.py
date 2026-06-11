@@ -5,7 +5,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from typing import List, Dict, Any, Optional
-
+giphy_api_key = os.getenv("GIPHY_API_KEY", "MISSING")
 def safe_int(val: Any, default: int = 0) -> int:
     try:
         return int(float(val))

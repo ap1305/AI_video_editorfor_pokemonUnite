@@ -2,18 +2,15 @@ import os
 import json
 import base64
 import cv2
-from openai import OpenAI
+import requests
 
 class StoryAnalyst:
     def __init__(self, api_key: str, base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"):
         """
-        Initializes the Story Analyst using an OpenAI-compatible client for Qwen-VL.
+        Initializes the Story Analyst using a direct HTTP client for Qwen-VL.
         """
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url
-        )
-        # Using the recommended multimodal model
+        self.api_key = api_key
+        self.base_url = base_url
         self.model_name = "qwen-vl-max"
 
     def _extract_frames(self, video_path: str, fps_target: int = 1) -> list:
@@ -60,6 +57,106 @@ class StoryAnalyst:
         cap.release()
         return frames_base64
 
+    def _execute_with_colab_fallback(self, messages: list) -> str:
+        """
+        Direct HTTP request bypassing the OpenAI wrapper for robust compatibility.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": 800
+        }
+        
+        endpoint = f"{self.base_url}/chat/completions"
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=120)
+        
+        if response.status_code != 200:
+            raise Exception(f"API Error {response.status_code}: {response.text}")
+            
+        return response.json()['choices'][0]['message']['content']
+        
+    def _clamp_story_timing(self, story_contract: dict, frames_data: list) -> dict:
+        """
+        Repairs hallucinated LLM timestamps so Director/Validator always receive
+        physically valid PACED_CLIP timing.
+        """
+        def sf(value, default=0.0):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        # Prefer LLM clip_duration if valid, otherwise use last extracted frame timestamp
+        fallback_dur = frames_data[-1]["timestamp"] if frames_data else 0.0
+        clip_dur = sf(story_contract.get("clip_duration"), fallback_dur)
+
+        if clip_dur <= 0:
+            clip_dur = max(fallback_dur, 1.0)
+
+        story_contract["clip_duration"] = round(clip_dur, 2)
+
+        # Clamp payoff timestamp
+        payoff = sf(story_contract.get("payoff_timestamp"), clip_dur * 0.75)
+        payoff = max(0.0, min(payoff, clip_dur))
+        story_contract["payoff_timestamp"] = round(payoff, 2)
+
+        # Clamp reaction window
+        rw = story_contract.get("reaction_window", {})
+        if not isinstance(rw, dict):
+            rw = {}
+
+        raw_start = sf(rw.get("start"), payoff)
+        raw_end = sf(rw.get("end"), min(clip_dur, payoff + 2.0))
+
+        start_t = max(0.0, min(raw_start, clip_dur))
+        end_t = max(0.0, min(raw_end, clip_dur))
+
+        # If Qwen placed reaction after video end, move it before the clip ends
+        if start_t >= clip_dur or end_t <= start_t:
+            end_t = clip_dur
+            start_t = max(0.0, clip_dur - 1.5)
+
+        # Ensure minimum useful reaction window
+        if end_t - start_t < 0.5 and clip_dur >= 1.5:
+            end_t = min(clip_dur, max(end_t, start_t + 1.5))
+            if end_t > clip_dur:
+                end_t = clip_dur
+                start_t = max(0.0, end_t - 1.5)
+
+        story_contract["reaction_window"] = {
+            "start": round(start_t, 2),
+            "end": round(end_t, 2)
+        }
+
+        # Clamp protected windows
+        clean_protected = []
+        protected_windows = story_contract.get("protected_windows", [])
+
+        if isinstance(protected_windows, list):
+            for pw in protected_windows:
+                if not isinstance(pw, dict):
+                    continue
+
+                pw_start = max(0.0, min(sf(pw.get("start")), clip_dur))
+                pw_end = max(0.0, min(sf(pw.get("end")), clip_dur))
+
+                if pw_start < pw_end:
+                    clean_protected.append({
+                        "start": round(pw_start, 2),
+                        "end": round(pw_end, 2),
+                        "reason": str(pw.get("reason", "protected gameplay"))
+                    })
+
+        story_contract["protected_windows"] = clean_protected
+
+        return story_contract
+
     def analyze_clip(self, clip_id: str, paced_video_path: str, edf_metadata: dict = None) -> dict:
         """
         Passes the extracted frames to Qwen to generate the creative_story.json contract.
@@ -70,7 +167,7 @@ class StoryAnalyst:
         if not frames_data:
             raise ValueError(f"Failed to extract frames from {paced_video_path}")
 
-        print(f"🧠 [Story Analyst] Sending {len(frames_data)} frames to Qwen Vision...")
+        print(f"🧠 [Story Analyst] Sending {len(frames_data)} frames to Vision model...")
 
         system_prompt = """
         You are the 'Story Analyst' for a Pokémon Unite editing pipeline.
@@ -124,23 +221,34 @@ class StoryAnalyst:
         ]
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=0.2, # Low temperature for analytical consistency
-                max_tokens=800
-            )
+            print(f"🧠 [Story Analyst] Calling LLM '{self.model_name}' via Colab fallback...")
             
-            raw_output = response.choices[0].message.content.strip()
+            # Direct HTTP Request Execution
+            raw_response = self._execute_with_colab_fallback(messages)
             
-            # Clean potential markdown if the model disobeys the prompt
-            if raw_output.startswith("```json"):
-                raw_output = raw_output.replace("```json", "").replace("```", "").strip()
-            elif raw_output.startswith("```"):
-                raw_output = raw_output.replace("```", "").strip()
+            # Strict Markdown Sanitization
+            cleaned = raw_response.strip()
+            md_ticks = chr(96) * 3 
+            md_json = md_ticks + "json"
+            
+            if cleaned.startswith(md_json):
+                cleaned = cleaned[len(md_json):]
+            elif cleaned.startswith(md_ticks):
+                cleaned = cleaned[len(md_ticks):]
+            if cleaned.endswith(md_ticks):
+                cleaned = cleaned[:-len(md_ticks)]
+                
+            raw_output = cleaned.strip()
 
             story_contract = json.loads(raw_output)
-            
+
+            # Ensure clip duration is present in the output contract
+            if frames_data and "clip_duration" not in story_contract:
+                story_contract["clip_duration"] = frames_data[-1]["timestamp"]
+
+            # Repair hallucinated timestamps before Director sees the story
+            story_contract = self._clamp_story_timing(story_contract, frames_data)
+
             # Save the contract to disk
             output_dir = "data/creative/story"
             os.makedirs(output_dir, exist_ok=True)
@@ -156,20 +264,19 @@ class StoryAnalyst:
             print(f"❌ [Story Analyst Error]: {str(e)}")
             return None
 
-# --- Quick Test Block (Comment out in production) ---
+# --- Quick Test Block ---
 if __name__ == "__main__":
-    import os
     from dotenv import load_dotenv
     load_dotenv()
     
     # Initialize the analyst
     analyst = StoryAnalyst(api_key=os.getenv("QWEN_API_KEY"))
     
-    # Test path (Replace with an actual paced clip from your data/renders folder)
     test_clip_path = "data/renders/viral_short_clip_1.mp4"
     
     if os.path.exists(test_clip_path):
         story = analyst.analyze_clip("clip_001", test_clip_path)
-        print(json.dumps(story, indent=2))
+        if story:
+            print(json.dumps(story, indent=2))
     else:
         print(f"Test clip not found at {test_clip_path}. Ready to integrate.")

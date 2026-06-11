@@ -22,6 +22,7 @@ from src.utils.qwen_pacing_analyzer import analyze_clip_pacing
 from src.utils.pipeline_recovery import PipelineRecoveryManager
 
 from src.editing.edf_compiler import generate_master_edf
+from src.creative.vod_chopper import VODChopper  # 👇 ADDED IMPORT
 
 load_dotenv()
 QWEN_API_KEY = os.getenv("QWEN_API_KEY", "ollama")
@@ -120,6 +121,7 @@ def enforce_safety_and_evaluate(edf_timeline):
         print(f"⚠️ [Quality Gate Warning] {ff_ratio*100:.1f}% fast-forward, but protected action is preserved. Passing.")
 
     return True, "Passed"
+
 def adapt_edf_v2_to_v1(v2_blueprint: dict) -> dict:
     if not v2_blueprint or "segments" in v2_blueprint:
         return v2_blueprint
@@ -154,9 +156,11 @@ def setup_video_source(input_dir: str = "data/inputs") -> List[str]:
     print("="*40)
     print("1. Download from YouTube (Live Stream / VOD)")
     print("2. Select from Local Folder")
+    # 👇 ADDED OPTION 3 👇
+    print("3. Download VOD, Chop into Matches, & Process")
     print("="*40)
     
-    choice = input("Enter choice (1 or 2): ").strip()
+    choice = input("Enter choice (1, 2, or 3): ").strip()
     
     if choice == "1":
         url = input("\n🔗 Enter YouTube URL: ").strip()
@@ -187,6 +191,37 @@ def setup_video_source(input_dir: str = "data/inputs") -> List[str]:
                 return []
         except ValueError:
             return []
+
+    # 👇 ADDED CHOPPER LOGIC 👇
+    elif choice == "3":
+        url = input("\n🔗 Enter 3-Hour VOD YouTube/Twitch URL: ").strip()
+        downloaded_file = fetch_youtube_video(url, input_dir)
+        
+        if downloaded_file:
+            print("\n✂️ Initializing VOD Chopper...")
+            chopper = VODChopper()
+            matches = chopper.scan_vod(downloaded_file)
+            
+            if matches:
+                chopper.slice_vod(downloaded_file, matches)
+                vod_name = os.path.splitext(os.path.basename(downloaded_file))[0]
+                sliced_videos = []
+                
+                # Collect the chopped segments from the chopper's output directory
+                for i in range(1, len(matches) + 1):
+                    sliced_path = os.path.join(chopper.output_dir, f"{vod_name}_match_{str(i).zfill(2)}.mp4")
+                    if os.path.exists(sliced_path):
+                        sliced_videos.append(sliced_path)
+                
+                print(f"\n✅ Sending {len(sliced_videos)} extracted matches to the Factory!")
+                return sliced_videos
+            else:
+                print("⚠️ No matches found in the downloaded VOD.")
+                return []
+        else:
+            print("❌ Failed to download VOD.")
+            return []
+
     return []
 
 # ==========================================

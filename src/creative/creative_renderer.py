@@ -13,6 +13,12 @@ def safe_float(val: Any, default: float = 0.0) -> float:
     try: return float(val)
     except (ValueError, TypeError): return default
 
+def finite_clamp(value: Any, default: float, minimum: float, maximum: float) -> float:
+    parsed = safe_float(value, default)
+    if not math.isfinite(parsed):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
 class CreativeRenderer:
     ALLOWED_TREATMENTS = {"REACTION_OVERLAY", "TEXT_AND_SOUND", "SOUND_ONLY", "NO_MEME"}
 
@@ -21,6 +27,14 @@ class CreativeRenderer:
         self.renders_dir = "data/creative/renders"
         self.history_path = "data/creative/usage_history.json"
         self.audits_dir = "data/creative/render_audits"
+        self.gameplay_top_y = float(self.config.get("gameplay_top_y", 0.12))
+        self.gameplay_bottom_y = float(self.config.get("gameplay_bottom_y", 0.57))
+
+        self.force_shorts_black_space = bool(self.config.get("force_shorts_black_space", True))
+        self.shorts_black_space_box = self.config.get(
+            "shorts_black_space_box",
+            [0.05, 0.70, 0.95, 0.94]
+        )
         
         os.makedirs(self.renders_dir, exist_ok=True)
         os.makedirs(self.audits_dir, exist_ok=True)
@@ -31,7 +45,6 @@ class CreativeRenderer:
         self.has_nvenc = self._verify_nvenc_capability()
         self.timeout = int(self.config.get("render_timeout", 300))
         
-        # Configurable Technical Defaults
         self.enc_nvenc_preset = self.config.get("nvenc_preset", "p4")
         self.enc_nvenc_bitrate = self.config.get("nvenc_bitrate", "8M")
         self.enc_x264_preset = self.config.get("libx264_preset", "fast")
@@ -86,15 +99,21 @@ class CreativeRenderer:
         except Exception as e:
             return {"valid": False, "error": str(e)}
 
-    def _validate_box(self, box: Any) -> bool:
-        if not isinstance(box, list) or len(box) != 4: return False
+    def _normalize_box(self, box: Any) -> Optional[List[float]]:
+        if not isinstance(box, list) or len(box) != 4:
+            return None
         try:
-            x1, y1, x2, y2 = [float(v) for v in box]
-            if not all(math.isfinite(v) for v in [x1, y1, x2, y2]): return False
-            if not (0.0 <= x1 < x2 <= 1.0) or not (0.0 <= y1 < y2 <= 1.0): return False
-            return True
-        except (ValueError, TypeError):
-            return False
+            values = [float(value) for value in box]
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in values):
+            return None
+            
+        x1, y1, x2, y2 = values
+        if not (0.0 <= x1 < x2 <= 1.0): return None
+        if not (0.0 <= y1 < y2 <= 1.0): return None
+        
+        return values
 
     def _validate_timestamps(self, start_t: Any, end_t: Any, clip_dur: float) -> Tuple[bool, float, float]:
         try:
@@ -110,7 +129,6 @@ class CreativeRenderer:
         if not asset_id: return False
         lock_path = self.history_path + ".lock"
         
-        # Concurrency safety: wait for lock
         for _ in range(100): 
             try:
                 fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
@@ -180,7 +198,6 @@ class CreativeRenderer:
                 if os.path.exists(part_path): os.remove(part_path)
                 return False, f"Duration mismatch. Expected {exp_dur:.1f}s, got {probe['duration']:.1f}s", elapsed, probe_res
 
-            # Allow for potential even-dimension rounding from source
             if abs(probe["width"] - exp_w) > 2 or abs(probe["height"] - exp_h) > 2:
                 if os.path.exists(part_path): os.remove(part_path)
                 return False, f"Dimension mismatch. Expected {exp_w}x{exp_h}, got {probe['width']}x{probe['height']}", elapsed, probe_res
@@ -205,6 +222,11 @@ class CreativeRenderer:
             "render_plan_path": render_plan_path,
             "visual_asset_used": None,
             "sound_asset_used": None,
+            "background_music_enabled": False,         # 👇 ADDED BGM AUDITS
+            "background_music_mood": None,
+            "background_music_used": None,
+            "background_music_gain": 0.0,
+            "background_music_skipped_reason": None,
             "output_probe": {},
             "history_updated": False,
             "logs": []
@@ -245,9 +267,8 @@ class CreativeRenderer:
         clip_dur = base_meta["duration"]
         audit["expected_duration"] = clip_dur
 
-        # Run-specific output locking/concurrency
         target_output = os.path.join(self.renders_dir, f"{clip_id}_final_{run_id}.mp4")
-        part_output = target_output + ".part"
+        part_output = os.path.join(self.renders_dir, f".{clip_id}_{run_id}.part.mp4")
         audit["target_output"] = target_output
 
         base_cmd = ["ffmpeg", "-y", "-i", paced_video_path]
@@ -255,7 +276,6 @@ class CreativeRenderer:
         inputs_count = 1
         txt_tmp_file = None
         
-        # Base Normalization (Applies to NO_MEME as well)
         filter_complex.append("[0:v:0]setpts=PTS-STARTPTS,setsar=1[base_v]")
         last_v = "[base_v]"
         last_a = "0:a:0?" if has_audio else None
@@ -280,16 +300,40 @@ class CreativeRenderer:
                 if not valid_t: raise ValueError("Invalid overlay interval.")
                 
                 ov_dur = end_t - start_t
-                opacity = max(0.0, min(1.0, safe_float(params.get("opacity", 1.0))))
+                opacity = finite_clamp(params.get("opacity"), 1.0, 0.0, 1.0)
                 
-                box = params.get("placement", {}).get("box")
-                if not self._validate_box(box): raise ValueError("Invalid placement box.")
-                
-                w_px = max(2, int(round((box[2]-box[0])*b_w) / 2) * 2)
-                h_px = max(2, int(round((box[3]-box[1])*b_h) / 2) * 2)
-                x_px = max(0, int(box[0]*b_w))
-                y_px = max(0, int(box[1]*b_h))
-                if x_px + w_px > b_w or y_px + h_px > b_h: raise ValueError("Overlay dimensions exceed base video bounds.")
+                box = self._normalize_box(params.get("placement", {}).get("box"))
+
+                # Shorts mode override: force GIF into lower black meme space
+                if self.force_shorts_black_space:
+                    forced_box = self._normalize_box(self.shorts_black_space_box)
+                    if forced_box:
+                        box = forced_box
+                        audit["logs"].append(f"Overlay placement forced to Shorts black space: {box}")
+
+                if box is None:
+                    raise ValueError("Invalid placement box.")
+
+                # Convert allowed meme area to pixels
+                box_x1 = int(box[0] * b_w)
+                box_y1 = int(box[1] * b_h)
+                box_w = max(2, int((box[2] - box[0]) * b_w))
+                box_h = max(2, int((box[3] - box[1]) * b_h))
+
+                # Preserve original meme aspect ratio and center inside black space
+                asset_w = max(1, int(asset_probe.get("width", 1)))
+                asset_h = max(1, int(asset_probe.get("height", 1)))
+
+                scale_factor = min(box_w / asset_w, box_h / asset_h)
+
+                w_px = max(2, int(round((asset_w * scale_factor) / 2) * 2))
+                h_px = max(2, int(round((asset_h * scale_factor) / 2) * 2))
+
+                x_px = max(0, box_x1 + ((box_w - w_px) // 2))
+                y_px = max(0, box_y1 + ((box_h - h_px) // 2))
+
+                if x_px + w_px > b_w or y_px + h_px > b_h:
+                    raise ValueError("Overlay dimensions exceed base video bounds.")
 
                 loop_policy = params.get("loop_policy", "NO_LOOP")
                 if loop_policy == "LOOP_TO_INTERVAL": base_cmd.extend(["-stream_loop", "-1"])
@@ -300,7 +344,7 @@ class CreativeRenderer:
                 
                 filter_complex.append(
                     f"[{ov_idx}:v]trim=duration={ov_dur},setpts=PTS-STARTPTS+{start_t}/TB,"
-                    f"scale={w_px}:{h_px}:force_original_aspect_ratio=decrease,format=rgba,colorchannelmixer=aa={opacity}[ovr]"
+                                        f"scale={w_px}:{h_px},format=rgba,colorchannelmixer=aa={opacity}[ovr]"
                 )
                 filter_complex.append(f"{last_v}[ovr]overlay=x={x_px}:y={y_px}:enable='between(t,{start_t},{end_t})':eof_action=pass:repeatlast=0[v_out]")
                 last_v = "[v_out]"
@@ -325,8 +369,9 @@ class CreativeRenderer:
                     safe_txt_file = self._escape_filter_path(txt_tmp_file)
                         
                     f_size = int(txt_p.get("font_size", 50))
-                    box = params.get("placement", {}).get("box")
-                    if not self._validate_box(box): raise ValueError("Invalid text placement box.")
+                    
+                    box = self._normalize_box(params.get("placement", {}).get("box"))
+                    if box is None: raise ValueError("Invalid text placement box.")
                     
                     x_px = int(box[0]*b_w) + int(txt_p.get("margin_x", 10))
                     y_px = int(box[1]*b_h) + int(txt_p.get("margin_y", 10))
@@ -343,6 +388,10 @@ class CreativeRenderer:
                     last_v = "[v_out]"
 
                 snd_p = params.get("sound", {})
+                
+                if treatment == "SOUND_ONLY" and not snd_p:
+                    raise ValueError("SOUND_ONLY requires a sound asset contract.")
+                    
                 if snd_p:
                     snd_path = snd_p.get("path")
                     snd_probe = self._probe_media(snd_path) if snd_path else {"valid": False}
@@ -358,8 +407,8 @@ class CreativeRenderer:
                     s_idx = inputs_count
                     inputs_count += 1
                     
-                    duck_db = max(-60.0, min(0.0, safe_float(snd_p.get("ducking_db", -5.0))))
-                    gain = max(0.0, min(2.0, safe_float(snd_p.get("gain", 1.0))))
+                    duck_db = finite_clamp(snd_p.get("ducking_db"), -5.0, -60.0, 0.0)
+                    gain = finite_clamp(snd_p.get("gain"), 1.0, 0.0, 2.0)
                     delay_ms = int(start_t * 1000)
                     
                     filter_complex.append(
@@ -374,7 +423,64 @@ class CreativeRenderer:
                     else:
                         last_a = "[sfx]"
 
-            # Finalize command
+            # ---------------------------------------------------------
+            # C. BACKGROUND MUSIC (Phase 2 Mix Integration) 👇 ADDED
+            # ---------------------------------------------------------
+            bgm_plan = plan.get("background_music", {})
+            bgm_enabled = bgm_plan.get("enabled", False)
+            bgm_path = bgm_plan.get("music_path")
+
+            if bgm_enabled and bgm_path and os.path.exists(bgm_path):
+                bgm_gain = safe_float(bgm_plan.get("gain", 0.18))
+                fade_in = safe_float(bgm_plan.get("fade_in", 0.5))
+                fade_out = safe_float(bgm_plan.get("fade_out", 1.0))
+                
+                # Loop BGM seamlessly if it's shorter than the clip
+                if bgm_plan.get("loop_to_duration", True):
+                    base_cmd.extend(["-stream_loop", "-1"])
+                
+                base_cmd.extend(["-i", bgm_path])
+                bgm_idx = inputs_count
+                inputs_count += 1
+                
+                bgm_filters = []
+                bgm_filters.append(f"atrim=duration={clip_dur}")
+                bgm_filters.append("asetpts=PTS-STARTPTS")
+                
+                if fade_in > 0:
+                    bgm_filters.append(f"afade=t=in:st=0:d={fade_in}")
+                if fade_out > 0 and clip_dur > fade_out:
+                    fade_out_st = clip_dur - fade_out
+                    bgm_filters.append(f"afade=t=out:st={fade_out_st}:d={fade_out}")
+                
+                # Duck background music aggressively during the meme reaction
+                duck_str = ""
+                if treatment != "NO_MEME":
+                    valid_m, m_start, m_end = self._validate_timestamps(params.get("start_time"), params.get("end_time"), clip_dur)
+                    if valid_m and m_end > m_start:
+                        duck_str = f",volume=enable='between(t,{m_start},{m_end})':volume=-10dB"
+                
+                bgm_filters.append(f"volume={bgm_gain}{duck_str}")
+                filter_complex.append(f"[{bgm_idx}:a]{','.join(bgm_filters)}[bgm_out]")
+                
+                # Final Mixdown
+                if last_a:
+                    filter_complex.append(f"{last_a}[bgm_out]amix=inputs=2:duration=first:dropout_transition=0,alimiter=level_in=1:level_out=1:limit=0.9[a_final]")
+                    last_a = "[a_final]"
+                else:
+                    last_a = "[bgm_out]"
+                
+                audit["background_music_enabled"] = True
+                audit["background_music_mood"] = bgm_plan.get("music_mood")
+                audit["background_music_used"] = bgm_path
+                audit["background_music_gain"] = bgm_gain
+                audit["background_music_skipped_reason"] = None
+            else:
+                audit["background_music_enabled"] = False
+                audit["background_music_mood"] = bgm_plan.get("music_mood")
+                audit["background_music_used"] = None
+                audit["background_music_skipped_reason"] = bgm_plan.get("skip_reason", "Not enabled, path missing, or file deleted")
+
             filter_args = []
             if filter_complex: filter_args = ["-filter_complex", ";".join(filter_complex)]
                 
@@ -393,7 +499,10 @@ class CreativeRenderer:
                 
                 test_cmd = base_cmd + filter_args + map_args + enc_flags + output_common + [part_output]
                 
-                success, msg, elapsed, probe_res = self._execute_render(test_cmd, target_output, part_output, exp_dur=clip_dur, req_audio=(has_audio or bool(params.get("sound"))), exp_w=b_w, exp_h=b_h)
+                # Check for audio requirement: base video OR sfx overlay OR bgm
+                requires_audio = has_audio or bool(params.get("sound")) or audit["background_music_enabled"]
+                
+                success, msg, elapsed, probe_res = self._execute_render(test_cmd, target_output, part_output, exp_dur=clip_dur, req_audio=requires_audio, exp_w=b_w, exp_h=b_h)
                 audit["logs"].append(f"{enc_name} Result: {msg}")
                 audit["elapsed_time"] = round(elapsed, 2)
                 audit["output_probe"] = probe_res
@@ -403,7 +512,6 @@ class CreativeRenderer:
             if not success:
                 return self._save_audit(clip_id, False, audit)
 
-            # Success Post-Processing
             if plan.get("usage_mark_required_after_render"):
                 audit["history_updated"] = self._atomic_history_update(plan.get("selected_asset", {}).get("candidate_id"))
                 
