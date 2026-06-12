@@ -1,99 +1,191 @@
-import os
-import shutil
-import uuid
-import subprocess
-from src.preprocess.vod_moment_scanner import VODMomentScanner
-from src.preprocess.gameplay_verifier import GameplayVerifier
-from src.preprocess.verified_clip_cutter import VerifiedClipCutter
+"""
+CRUSHER11 VOD STUDIO - Full Match Extraction Pipeline (v3)
 
-# 👇 Bringing in the tool we built specifically for your actual goal
+Takes long Pokemon Unite VODs (local file, YouTube/Twitch URL, or a folder
+of videos) and extracts only the COMPLETE gameplay matches (GO -> Time's Up)
+into data/gameplay_segments/. Lobby / queue / menus / loading footage is
+ignored. This pipeline never writes to data/creative/shortlisted_clips/.
+
+Menu:
+    1. Extract full matches from local VOD
+    2. Download YouTube/Twitch VOD and extract full matches
+    3. Copy all videos from input folder into data/raw_vods
+    4. List raw VODs
+    5. Exit
+"""
+
+import os
+import re
+import shutil
+import subprocess
+
 from src.preprocess.match_extractor import MatchExtractor
 
-def get_json_file(directory: str, prefix: str):
-    files = [f for f in os.listdir(directory) if f.startswith(prefix) and f.endswith(".json")]
-    if not files: return None
-    if len(files) == 1: return os.path.join(directory, files[0])
-    
-    print("\n📂 Select File:")
-    for idx, f in enumerate(files, 1): print(f"  {idx}. {f}")
-    choice = int(input(f"Choice [1-{len(files)}]: ")) - 1
-    return os.path.join(directory, files[choice])
+RAW_DIR = os.path.join("data", "raw_vods")
+GAMEPLAY_DIR = os.path.join("data", "gameplay_segments")
+DEBUG_DIR = os.path.join("data", "debug")
+
+VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov")
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def ensure_dirs():
+    for d in (RAW_DIR, GAMEPLAY_DIR, DEBUG_DIR, os.path.join("data", "inputs")):
+        os.makedirs(d, exist_ok=True)
+
+
+def list_raw_vods() -> list:
+    if not os.path.isdir(RAW_DIR):
+        return []
+    files = [f for f in sorted(os.listdir(RAW_DIR))
+             if f.lower().endswith(VIDEO_EXTS)
+             and os.path.isfile(os.path.join(RAW_DIR, f))]
+    return files
+
+
+def pick_vod() -> str:
+    files = list_raw_vods()
+    if not files:
+        print(f"❌ No videos found in {RAW_DIR}/")
+        print("   Use option 2 (download) or option 3 (copy from folder) first.")
+        return ""
+    print(f"\n📂 Videos in {RAW_DIR}/:")
+    for idx, f in enumerate(files, 1):
+        size_gb = os.path.getsize(os.path.join(RAW_DIR, f)) / (1024 ** 3)
+        print(f"  {idx}. {f}  ({size_gb:.2f} GB)")
+    raw = input(f"\nSelect video [1-{len(files)}]: ").strip()
+    if not raw.isdigit() or not (1 <= int(raw) <= len(files)):
+        print("❌ Invalid selection.")
+        return ""
+    return os.path.join(RAW_DIR, files[int(raw) - 1])
+
+
+def safe_filename(name: str) -> str:
+    name = re.sub(r"[^\w\-. ]", "_", name).strip()
+    return re.sub(r"\s+", "_", name)[:120] or "vod"
+
+
+# ---------------------------------------------------------------------------
+# menu actions
+# ---------------------------------------------------------------------------
+
+def action_extract_local():
+    vod = pick_vod()
+    if vod:
+        MatchExtractor().extract_matches(vod)
+
+
+def action_download_and_extract():
+    url = input("\n🔗 Enter YouTube/Twitch URL: ").strip()
+    if not url:
+        print("❌ No URL given.")
+        return
+
+    before = set(list_raw_vods())
+    print("\n⬇️ [Downloader] Fetching VOD with yt-dlp (this can take a while)...")
+    out_template = os.path.join(RAW_DIR, "%(title).80s_%(id)s.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "--restrict-filenames",
+        "-o", out_template,
+        url,
+    ]
+    try:
+        result = subprocess.run(cmd)
+    except FileNotFoundError:
+        print("❌ yt-dlp is not installed. Install it with: pip install yt-dlp")
+        return
+    if result.returncode != 0:
+        print("❌ Download failed. Check the URL and try again.")
+        return
+
+    new_files = sorted(set(list_raw_vods()) - before)
+    if not new_files:
+        print("⚠️ Download finished but no new video appeared in data/raw_vods/.")
+        return
+    target = os.path.join(RAW_DIR, new_files[-1])
+    print(f"✅ Downloaded: {target}")
+    MatchExtractor().extract_matches(target)
+
+
+def action_copy_from_folder():
+    folder = input("\n📁 Enter input folder path: ").strip().strip('"').strip("'")
+    folder = os.path.expanduser(folder)
+    if not os.path.isdir(folder):
+        print(f"❌ Not a valid folder: {folder}")
+        return
+
+    copied, skipped = 0, 0
+    for f in sorted(os.listdir(folder)):
+        src = os.path.join(folder, f)
+        if not os.path.isfile(src):
+            continue
+        if not f.lower().endswith(VIDEO_EXTS):
+            print(f"   ⏭️ Skipped (unsupported type): {f}")
+            skipped += 1
+            continue
+        dst = os.path.join(RAW_DIR, safe_filename(f))
+        if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src):
+            print(f"   ⏭️ Skipped (already in raw_vods): {f}")
+            skipped += 1
+            continue
+        print(f"   📥 Copying: {f} ...")
+        shutil.copy2(src, dst)
+        copied += 1
+    print(f"\n✅ Copied {copied} file(s), skipped {skipped}. Destination: {RAW_DIR}/")
+
+
+def action_list_raw_vods():
+    files = list_raw_vods()
+    if not files:
+        print(f"\n📂 {RAW_DIR}/ is empty (no {', '.join(VIDEO_EXTS)} files).")
+        return
+    print(f"\n📂 {len(files)} video(s) in {RAW_DIR}/:")
+    for idx, f in enumerate(files, 1):
+        size_gb = os.path.getsize(os.path.join(RAW_DIR, f)) / (1024 ** 3)
+        print(f"  {idx}. {f}  ({size_gb:.2f} GB)")
+
+
+# ---------------------------------------------------------------------------
+# main loop
+# ---------------------------------------------------------------------------
 
 def run_menu():
-    raw_dir = "data/raw_vods"
-    inputs_dir = "data/inputs"
-    shortlisted_dir = "data/creative/shortlisted_clips"
-    verified_dir = "data/vod_verified_candidates"
-    gameplay_dir = "data/gameplay_segments" # For the full matches
-    
-    for d in [raw_dir, inputs_dir, shortlisted_dir, verified_dir, gameplay_dir]:
-        os.makedirs(d, exist_ok=True)
-    
+    ensure_dirs()
     while True:
-        print("\n" + "="*50)
-        print("🎬 CRUSHER11 VOD STUDIO")
-        print("="*50)
-        print("--- GOAL A: SHORT VIRAL MOMENTS (30s) ---")
-        print("1. Scan VOD for Action Peaks")
-        print("2. Verify Peaks (Vision AI)")
-        print("3. Cut Verified Moments")
-        print("4. Copy to Shortlisted")
-        
-        print("\n--- GOAL B: FULL MATCH EXTRACTION (10+ mins) ---")
-        print("5. Extract Complete Matches (State Machine)")
-        
-        print("\n6. Download New VOD")
-        print("7. Exit")
-        print("="*50)
-        
-        choice = input("\nEnter choice [1-7]: ").strip()
-        
-        if choice == "1":
-            files = [f for f in os.listdir(raw_dir) if f.lower().endswith((".mp4", ".mkv"))]
-            if not files:
-                print("❌ No videos found in data/raw_vods/")
-                continue
-            for idx, f in enumerate(files, 1): print(f"  {idx}. {f}")
-            v_idx = int(input("Select video: ")) - 1
-            VODMomentScanner().scan_vod(os.path.join(raw_dir, files[v_idx]))
-            
-        elif choice == "2":
-            file = get_json_file(inputs_dir, "candidate_windows_raw_")
-            if file: GameplayVerifier().verify_candidates(file)
-            
-        elif choice == "3":
-            file = get_json_file(inputs_dir, "verified_candidate_windows_")
-            if file: VerifiedClipCutter().cut_approved_clips(file)
-            
-        elif choice == "4":
-            clips = [f for f in os.listdir(verified_dir) if f.endswith(".mp4")]
-            if not clips: continue
-            if input(f"Promote {len(clips)} clips to Creative? (y/n): ").lower() == 'y':
-                for c in clips: shutil.copy(os.path.join(verified_dir, c), os.path.join(shortlisted_dir, c))
-                print(f"✅ Promoted.")
+        print("\n" + "=" * 50)
+        print("🎬 CRUSHER11 VOD STUDIO - FULL MATCH EXTRACTION")
+        print("=" * 50)
+        print("1. Extract full matches from local VOD")
+        print("2. Download YouTube/Twitch VOD and extract full matches")
+        print("3. Copy all videos from input folder into data/raw_vods")
+        print("4. List raw VODs")
+        print("5. Exit")
+        print("=" * 50)
 
-        # 👇 THIS IS WHAT YOU ACTUALLY WANT TO RUN
-        elif choice == "5":
-            files = [f for f in os.listdir(raw_dir) if f.lower().endswith((".mp4", ".mkv"))]
-            if not files:
-                print("❌ No videos found in data/raw_vods/")
-                continue
-            print("\n📂 Available Videos for Full Match Extraction:")
-            for idx, f in enumerate(files, 1): print(f"  {idx}. {f}")
-            v_idx = int(input("Select video: ")) - 1
-            
-            target_vod = os.path.join(raw_dir, files[v_idx])
-            MatchExtractor().extract_matches(target_vod)
+        choice = input("\nEnter choice [1-5]: ").strip()
+        try:
+            if choice == "1":
+                action_extract_local()
+            elif choice == "2":
+                action_download_and_extract()
+            elif choice == "3":
+                action_copy_from_folder()
+            elif choice == "4":
+                action_list_raw_vods()
+            elif choice == "5":
+                print("🛑 Exiting.")
+                break
+            else:
+                print("❌ Invalid choice. Enter a number between 1 and 5.")
+        except KeyboardInterrupt:
+            print("\n⚠️ Interrupted. Back to menu.")
 
-        elif choice == "6":
-            url = input("\n🔗 Enter YouTube/Twitch URL: ").strip()
-            safe_name = f"vod_download_{uuid.uuid4().hex[:6]}.mp4"
-            target = os.path.join(raw_dir, safe_name)
-            subprocess.run(["yt-dlp", "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best", "--merge-output-format", "mp4", "-o", target, url])
-
-        elif choice == "7":
-            print("🛑 Exiting.")
-            break
 
 if __name__ == "__main__":
     run_menu()
